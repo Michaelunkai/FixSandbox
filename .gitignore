@@ -1,0 +1,7 @@
+# Runtime diagnostics are host-specific and may contain local account or path data.
+*.log
+
+# PowerShell/editor noise.
+*.tmp
+*.bak
+~$*
