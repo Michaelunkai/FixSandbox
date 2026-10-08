@@ -3,6 +3,7 @@
 [CmdletBinding()]
 param(
     [switch]$Launch,
+    [switch]$HostFilesystemMirror,
     [ValidateRange(15, 180)]
     [int]$LaunchTimeoutSeconds = 90
 )
@@ -240,7 +241,148 @@ function Test-PendingRestart {
     }
 }
 
+function ConvertTo-XmlText {
+    param([AllowEmptyString()][string]$Value)
+
+    return [System.Security.SecurityElement]::Escape($Value)
+}
+
+function New-HostFilesystemMirrorConfiguration {
+    # Windows Sandbox cannot boot from a host disk or import a host Windows
+    # installation. This configuration deliberately limits the sharing to a
+    # read-only view of every mounted fixed drive. The separate control folder
+    # is writable solely so the guest can return a launch/mapping proof.
+    try {
+        $fixedDrives = @(
+            Get-CimInstance Win32_LogicalDisk -Filter 'DriveType = 3' -ErrorAction Stop |
+                Where-Object { $_.DeviceID -match '^[A-Za-z]:$' -and (Test-Path -LiteralPath ($_.DeviceID + '\')) } |
+                Sort-Object DeviceID
+        )
+        if ($fixedDrives.Count -eq 0) {
+            throw 'No mounted fixed drives were found to map into the Sandbox.'
+        }
+
+        $sessionRoot = Join-Path $scriptRoot '.sandbox-mirror-sessions'
+        $sessionPath = Join-Path $sessionRoot ([guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $sessionPath -Force | Out-Null
+
+        $guestBootstrapPath = Join-Path $sessionPath 'Guest-MirrorProof.ps1'
+        $proofPath = Join-Path $sessionPath 'Guest-MirrorProof.json'
+        $configurationPath = Join-Path $sessionPath 'Host-Filesystem-Mirror.wsb'
+
+        @'
+$ErrorActionPreference = 'Stop'
+$mappedDrives = @(
+    Get-ChildItem -LiteralPath 'C:\HostDrives' -Directory -ErrorAction Stop |
+        Sort-Object Name |
+        ForEach-Object {
+            [pscustomobject]@{
+                Drive = $_.Name
+                Present = Test-Path -LiteralPath $_.FullName
+            }
+        }
+)
+
+$proof = [pscustomobject]@{
+    SchemaVersion = 1
+    CreatedUtc = (Get-Date).ToUniversalTime().ToString('o')
+    GuestUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    MappedDrives = $mappedDrives
+}
+
+$temporaryProofPath = 'C:\SandboxControl\Guest-MirrorProof.json.tmp'
+$proof | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $temporaryProofPath -Encoding utf8
+Move-Item -LiteralPath $temporaryProofPath -Destination 'C:\SandboxControl\Guest-MirrorProof.json' -Force
+'@ | Set-Content -LiteralPath $guestBootstrapPath -Encoding utf8 -NoNewline
+
+        $mappedFolders = [System.Collections.Generic.List[string]]::new()
+        foreach ($drive in $fixedDrives) {
+            $letter = $drive.DeviceID.TrimEnd(':')
+            $mappedFolder = @"
+    <MappedFolder>
+      <HostFolder>$(ConvertTo-XmlText -Value ($drive.DeviceID + '\'))</HostFolder>
+      <SandboxFolder>C:\HostDrives\$letter</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+"@
+            $mappedFolders.Add($mappedFolder)
+        }
+        $controlMappedFolder = @"
+    <MappedFolder>
+      <HostFolder>$(ConvertTo-XmlText -Value $sessionPath)</HostFolder>
+      <SandboxFolder>C:\SandboxControl</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+"@
+        $mappedFolders.Add($controlMappedFolder)
+
+        $configuration = @"
+<Configuration>
+  <VGpu>Default</VGpu>
+  <Networking>Disable</Networking>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <PrinterRedirection>Disable</PrinterRedirection>
+  <AudioInput>Disable</AudioInput>
+  <VideoInput>Disable</VideoInput>
+  <MappedFolders>
+$($mappedFolders -join [Environment]::NewLine)
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\SandboxControl\Guest-MirrorProof.ps1</Command>
+  </LogonCommand>
+</Configuration>
+"@
+        $configuration | Set-Content -LiteralPath $configurationPath -Encoding utf8 -NoNewline
+
+        Write-Result -Level PASS -Message "Created read-only host-filesystem mirror configuration for drives $($fixedDrives.DeviceID -join ', '); network, clipboard, printers, microphone, and camera are disabled." | Out-Null
+        return [pscustomobject]@{
+            ConfigurationPath = $configurationPath
+            ProofPath = $proofPath
+            ExpectedDrives = @($fixedDrives | ForEach-Object { $_.DeviceID.TrimEnd(':') } | Sort-Object)
+            SessionPath = $sessionPath
+        }
+    }
+    catch {
+        Add-Failure -Message "Host filesystem mirror configuration: $($_.Exception.Message)" | Out-Null
+        return $null
+    }
+}
+
+function Test-HostFilesystemMirrorProof {
+    param(
+        [string]$ProofPath,
+        [string[]]$ExpectedDrives
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $ProofPath)) {
+            return $false
+        }
+
+        $proof = Get-Content -LiteralPath $ProofPath -Raw | ConvertFrom-Json -ErrorAction Stop
+        $actualDrives = @($proof.MappedDrives | Where-Object { $_.Present -eq $true } | ForEach-Object { [string]$_.Drive } | Sort-Object)
+        $missing = @($ExpectedDrives | Where-Object { $_ -notin $actualDrives })
+        $unexpected = @($actualDrives | Where-Object { $_ -notin $ExpectedDrives })
+        if ($proof.SchemaVersion -ne 1 -or $missing.Count -gt 0 -or $unexpected.Count -gt 0) {
+            throw "Guest mapping proof does not match the generated configuration. Missing=$($missing -join ','); Unexpected=$($unexpected -join ',')."
+        }
+
+        Write-Result -Level PASS -Message "Guest proof verified: the read-only host-filesystem mirror is mounted at C:\HostDrives for $($ExpectedDrives -join ', '); guest user=$($proof.GuestUser)." | Out-Null
+        return $true
+    }
+    catch {
+        Add-Failure -Message "Host filesystem mirror proof: $($_.Exception.Message)" | Out-Null
+        return $false
+    }
+}
+
 function Launch-AndVerifySandbox {
+    param(
+        [string]$ConfigurationPath,
+        [string]$MirrorProofPath,
+        [string[]]$ExpectedMirrorDrives
+    )
+
     $sandboxExe = Join-Path $env:WINDIR 'System32\WindowsSandbox.exe'
     if (-not (Test-Path -LiteralPath $sandboxExe)) {
         Add-Failure -Message "Windows Sandbox executable not found at $sandboxExe."
@@ -249,9 +391,21 @@ function Launch-AndVerifySandbox {
 
     try {
         $existing = @(Get-Process -Name WindowsSandboxRemoteSession -ErrorAction SilentlyContinue)
+        if ($existing.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($ConfigurationPath)) {
+            throw 'A Windows Sandbox session is already open. Close it yourself, then rerun this script so the new host-filesystem mirror configuration can be proven. The script will not close a session because Sandbox content is disposable.'
+        }
         if ($existing.Count -eq 0) {
-            $null = Start-Process -FilePath $sandboxExe -WorkingDirectory (Split-Path -Parent $sandboxExe)
-            Write-Result -Level INFO -Message 'Launched WindowsSandbox.exe.'
+            if ([string]::IsNullOrWhiteSpace($ConfigurationPath)) {
+                $null = Start-Process -FilePath $sandboxExe -WorkingDirectory (Split-Path -Parent $sandboxExe)
+                Write-Result -Level INFO -Message 'Launched WindowsSandbox.exe.'
+            }
+            else {
+                if (-not (Test-Path -LiteralPath $ConfigurationPath)) {
+                    throw "Sandbox configuration was not found at $ConfigurationPath."
+                }
+                $null = Start-Process -FilePath $ConfigurationPath -WorkingDirectory (Split-Path -Parent $ConfigurationPath)
+                Write-Result -Level INFO -Message "Launched Windows Sandbox using $ConfigurationPath."
+            }
         }
         else {
             Write-Result -Level INFO -Message 'Windows Sandbox remote-session client was already running; using the existing launch for verification.'
@@ -277,7 +431,9 @@ function Launch-AndVerifySandbox {
             $serverSeen = $serverProcesses.Count -gt 0
             $memorySeen = $memoryProcesses.Count -gt 0
 
-            if ($windowSeen -and $workerSeen -and $serverSeen -and $memorySeen) {
+            $mirrorProven = [string]::IsNullOrWhiteSpace($MirrorProofPath) -or (Test-HostFilesystemMirrorProof -ProofPath $MirrorProofPath -ExpectedDrives $ExpectedMirrorDrives)
+
+            if ($windowSeen -and $workerSeen -and $serverSeen -and $memorySeen -and $mirrorProven) {
                 Write-Result -Level PASS -Message "Sandbox launch verified: responsive Windows Sandbox window, remote-session client, server, vmwp worker, and vmmemWindowsSandbox are present; gcs=$($guestCompute.Status)."
                 return
             }
@@ -333,7 +489,15 @@ Ensure-ServiceRunning -Name 'hns'
 Ensure-ServiceRunning -Name 'CmService'
 
 if ($Launch) {
-    Launch-AndVerifySandbox
+    if ($HostFilesystemMirror) {
+        $mirror = New-HostFilesystemMirrorConfiguration
+        if ($null -ne $mirror) {
+            Launch-AndVerifySandbox -ConfigurationPath $mirror.ConfigurationPath -MirrorProofPath $mirror.ProofPath -ExpectedMirrorDrives $mirror.ExpectedDrives
+        }
+    }
+    else {
+        Launch-AndVerifySandbox
+    }
 }
 
 $elapsed = [math]::Round(((Get-Date) - $startedAt).TotalSeconds, 1)

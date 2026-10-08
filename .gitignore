@@ -5,3 +5,10 @@
 *.tmp
 *.bak
 ~$*
+
+# Per-launch Windows Sandbox configuration and guest mapping proof.
+.sandbox-mirror-sessions/
+.sandbox-bcd-sessions/
+
+# Disposable local P2V capability probe artifacts.
+.p2v-capability-test/
