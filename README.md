@@ -1,4 +1,4 @@
-# Windows Sandbox Repair
+# FixSandbox — Windows Sandbox Repair
 
 An idempotent, no-reboot PowerShell repair script for Windows Sandbox on Windows 11.
 
